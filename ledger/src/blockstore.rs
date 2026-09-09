@@ -6649,5 +6649,29 @@ pub fn make_chaining_slot_entries(
     slots_shreds_and_entries
 }
 
+// exposed (undeprecated from `#[cfg(test)]`) for downstream crates
+// (jito-shredstream-proxy) that build their own shred-fixture test helpers
+// against this crate. Mirrors `blockstore::tests::make_slot_entries_with_transactions`.
+pub fn make_slot_entries_with_transactions(num_entries: u64) -> Vec<Entry> {
+    let mut entries: Vec<Entry> = Vec::new();
+    for x in 0..num_entries {
+        let transaction = solana_transaction::Transaction::new_with_compiled_instructions(
+            &[&Keypair::new()],
+            &[solana_pubkey::new_rand()],
+            Hash::default(),
+            vec![solana_pubkey::new_rand()],
+            vec![solana_message::compiled_instruction::CompiledInstruction::new(1, &(), vec![0])],
+        );
+        entries.push(solana_entry::entry::next_entry_mut(
+            &mut Hash::default(),
+            0,
+            vec![transaction],
+        ));
+        let mut tick = create_ticks(1, 0, hashv(&[&wincode::serialize(&x).unwrap()]));
+        entries.append(&mut tick);
+    }
+    entries
+}
+
 #[cfg(test)]
 pub mod tests;

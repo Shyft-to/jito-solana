@@ -1,4 +1,3 @@
-#[cfg(test)]
 use crate::shred::ShredType;
 use {
     crate::{
@@ -48,11 +47,11 @@ const_assert_eq!(ShredCode::SIZE_OF_PAYLOAD, 1228);
 // The slice past signature till the end of the data buffer is erasure coded.
 // The slice past signature and before the merkle proof is hashed to generate
 // the Merkle tree. The root of the Merkle tree is signed.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct ShredData {
-    common_header: ShredCommonHeader,
-    data_header: DataShredHeader,
-    payload: Payload,
+    pub common_header: ShredCommonHeader,
+    pub data_header: DataShredHeader,
+    pub payload: Payload,
 }
 
 // Layout: {common, coding} headers | erasure coded shard
@@ -61,15 +60,15 @@ pub struct ShredData {
 //     | [Retransmitter's signature if resigned]
 // The slice past signature and before the merkle proof is hashed to generate
 // the Merkle tree. The root of the Merkle tree is signed.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct ShredCode {
-    common_header: ShredCommonHeader,
-    coding_header: CodingShredHeader,
-    payload: Payload,
+    pub common_header: ShredCommonHeader,
+    pub coding_header: CodingShredHeader,
+    pub payload: Payload,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum Shred {
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub enum Shred {
     ShredCode(ShredCode),
     ShredData(ShredData),
 }
@@ -82,12 +81,12 @@ impl Shred {
     dispatch!(fn set_chained_merkle_root(&mut self, chained_merkle_root: &Hash) -> Result<(), Error>);
     dispatch!(fn set_signature(&mut self, signature: Signature));
     dispatch!(fn signed_data(&self) -> Result<Hash, Error>);
-    dispatch!(pub(super) fn common_header(&self) -> &ShredCommonHeader);
-    dispatch!(pub(super) fn payload(&self) -> &Payload);
+    dispatch!(pub fn common_header(&self) -> &ShredCommonHeader);
+    dispatch!(pub fn payload(&self) -> &Payload);
     dispatch!(pub(super) fn set_retransmitter_signature(&mut self, signature: &Signature) -> Result<(), Error>);
 
     #[inline]
-    fn fec_set_index(&self) -> u32 {
+    pub fn fec_set_index(&self) -> u32 {
         self.common_header().fec_set_index
     }
 
@@ -123,7 +122,7 @@ impl Shred {
         &self.common_header().signature
     }
 
-    pub(super) fn from_payload<T: AsRef<[u8]>>(shred: T) -> Result<Self, Error>
+    pub fn from_payload<T: AsRef<[u8]>>(shred: T) -> Result<Self, Error>
     where
         Payload: From<T>,
     {
@@ -131,6 +130,16 @@ impl Shred {
             ShredVariant::MerkleCode { .. } => Ok(Self::ShredCode(ShredCode::from_payload(shred)?)),
             ShredVariant::MerkleData { .. } => Ok(Self::ShredData(ShredData::from_payload(shred)?)),
         }
+    }
+}
+
+impl Shred {
+    pub fn index(&self) -> u32 {
+        self.common_header().index
+    }
+
+    pub fn shred_type(&self) -> ShredType {
+        ShredType::from(self.common_header().shred_variant)
     }
 }
 
@@ -142,14 +151,6 @@ impl Shred {
     dispatch!(pub(super) fn merkle_root(&self) -> Result<Hash, Error>);
     dispatch!(pub(super) fn retransmitter_signature(&self) -> Result<Signature, Error>);
     dispatch!(pub(super) fn retransmitter_signature_offset(&self) -> Result<usize, Error>);
-
-    fn index(&self) -> u32 {
-        self.common_header().index
-    }
-
-    fn shred_type(&self) -> ShredType {
-        ShredType::from(self.common_header().shred_variant)
-    }
 }
 
 impl ShredData {
@@ -214,13 +215,13 @@ impl ShredData {
         }
     }
 
-    pub(super) fn last_in_slot(&self) -> bool {
+    pub fn last_in_slot(&self) -> bool {
         self.data_header
             .flags
             .contains(ShredFlags::LAST_SHRED_IN_SLOT)
     }
 
-    pub(super) fn data_complete(&self) -> bool {
+    pub fn data_complete(&self) -> bool {
         self.data_header
             .flags
             .contains(ShredFlags::DATA_COMPLETE_SHRED)
@@ -666,7 +667,7 @@ fn get_merkle_node(shred: &[u8], offsets: Range<usize>) -> Result<Hash, Error> {
     Ok(hashv(&[MERKLE_HASH_PREFIX_LEAF, node]))
 }
 
-pub(super) fn recover(
+pub fn recover(
     mut shreds: Vec<Shred>,
     reed_solomon_cache: &ReedSolomonCache,
 ) -> Result<impl Iterator<Item = Result<Shred, Error>> + use<>, Error> {

@@ -13,7 +13,7 @@ use {
     wincode::{SchemaRead, SchemaWrite},
 };
 
-#[derive(Clone, Debug, Eq, SchemaRead, SchemaWrite)]
+#[derive(Clone, Debug, Eq, Hash, SchemaRead, SchemaWrite)]
 pub struct Payload {
     pub bytes: Bytes,
 }

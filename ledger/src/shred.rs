@@ -90,11 +90,11 @@ mod common;
 pub mod filter;
 pub mod merkle;
 pub mod merkle_tree;
-mod payload;
+pub mod payload;
 mod shred_code;
 pub(crate) mod shred_data;
 mod stats;
-mod traits;
+pub mod traits;
 pub mod wire;
 
 // Alias for shred::wire::* for the old code.
@@ -112,7 +112,7 @@ pub const SIZE_OF_NONCE: usize = std::mem::size_of::<Nonce>();
 const SIZE_OF_COMMON_SHRED_HEADER: usize = 83;
 pub const SIZE_OF_DATA_SHRED_HEADERS: usize = 88;
 const SIZE_OF_CODING_SHRED_HEADERS: usize = 89;
-const SIZE_OF_SIGNATURE: usize = SIGNATURE_BYTES;
+pub const SIZE_OF_SIGNATURE: usize = SIGNATURE_BYTES;
 
 // Shreds are uniformly split into erasure batches with a "target" number of
 // data shreds per each batch as below. The actual number of data shreds in
@@ -148,7 +148,7 @@ pub const fn get_data_shred_bytes_per_batch_typical() -> u64 {
 // LAST_SHRED_IN_SLOT also implies DATA_COMPLETE_SHRED.
 // So it cannot be LAST_SHRED_IN_SLOT if not also DATA_COMPLETE_SHRED.
 bitflags! {
-    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+    #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, Serialize, Deserialize)]
     pub struct ShredFlags:u8 {
         const SHRED_TICK_REFERENCE_MASK = 0b0011_1111;
         const DATA_COMPLETE_SHRED       = 0b0100_0000;
@@ -247,7 +247,7 @@ pub enum ShredType {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-enum ShredVariant {
+pub enum ShredVariant {
     // proof_size is the number of Merkle proof entries, and is encoded in the
     // lowest 4 bits of the binary representation. The first 4 bits identify
     // the shred variant:
@@ -260,31 +260,31 @@ enum ShredVariant {
 }
 
 /// A common header that is present in data and code shred headers
-#[derive(Clone, Copy, Debug, PartialEq, Eq, SchemaRead, SchemaWrite)]
-struct ShredCommonHeader {
-    signature: Signature,
-    shred_variant: ShredVariant,
-    slot: Slot,
-    index: u32,
-    version: u16,
-    fec_set_index: u32,
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, SchemaRead, SchemaWrite)]
+pub struct ShredCommonHeader {
+    pub signature: Signature,
+    pub shred_variant: ShredVariant,
+    pub slot: Slot,
+    pub index: u32,
+    pub version: u16,
+    pub fec_set_index: u32,
 }
 
 /// The data shred header has parent offset and flags
-#[derive(Clone, Copy, Debug, PartialEq, Eq, SchemaRead, SchemaWrite)]
-struct DataShredHeader {
-    parent_offset: u16,
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, SchemaRead, SchemaWrite)]
+pub struct DataShredHeader {
+    pub parent_offset: u16,
     #[wincode(with = "PodShredFlags")]
-    flags: ShredFlags,
-    size: u16, // common shred header + data shred header + data
+    pub flags: ShredFlags,
+    pub size: u16, // common shred header + data shred header + data
 }
 
 /// The coding shred header has FEC information
-#[derive(Clone, Copy, Debug, PartialEq, Eq, SchemaRead, SchemaWrite)]
-struct CodingShredHeader {
-    num_data_shreds: u16,
-    num_coding_shreds: u16,
-    position: u16, // [0..num_coding_shreds)
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, SchemaRead, SchemaWrite)]
+pub struct CodingShredHeader {
+    pub num_data_shreds: u16,
+    pub num_coding_shreds: u16,
+    pub position: u16, // [0..num_coding_shreds)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
