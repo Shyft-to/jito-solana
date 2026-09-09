@@ -2114,6 +2114,7 @@ mod tests {
             response_sender,
             ctx.bank_forks.clone(),
             shared_leader_state.clone(),
+            None,
         );
         let optimistic_decision = BufferedPacketsDecision::Consume(optimistic_bank);
         bam_scheduler

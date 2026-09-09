@@ -1496,6 +1496,7 @@ mod tests {
             response_sender,
             bank_forks.clone(),
             shared_leader_state.clone(),
+            None,
         );
 
         let mut scheduler_controller = SchedulerController::new(

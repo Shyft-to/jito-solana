@@ -96,7 +96,6 @@ impl QosService {
             });
         }
         cost_tracker.add_transactions_in_flight(results.iter().flatten().count());
-        drop(cost_tracker);
         Some((results, reserved_cost))
     }
 
