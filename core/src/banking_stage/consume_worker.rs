@@ -20,7 +20,6 @@ use {
     solana_svm::transaction_error_metrics::TransactionErrorMetrics,
     solana_time_utils::AtomicInterval,
     std::{
-        marker::PhantomData,
         sync::{
             Arc,
             atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
@@ -31,23 +30,17 @@ use {
 };
 
 #[derive(Debug, Error)]
-pub enum ConsumeWorkerError<Tx> {
+pub enum ConsumeWorkerError {
     #[error("Failed to receive work from scheduler: {0}")]
     Recv(#[from] TryRecvError),
     #[error("Scheduler channel disconnected")]
-    Send(PhantomData<Tx>),
+    Send,
 }
 
-impl<Tx> From<SendError<FinishedConsumeWork<Tx>>> for ConsumeWorkerError<Tx> {
+impl<Tx> From<SendError<FinishedConsumeWork<Tx>>> for ConsumeWorkerError {
     fn from(_: SendError<FinishedConsumeWork<Tx>>) -> Self {
-        Self::Send(PhantomData)
+        Self::Send
     }
-}
-
-enum ProcessingStatus<Tx> {
-    Processed,
-    /// Work could not be processed due to lack of bank.
-    CouldNotProcess(ConsumeWork<Tx>),
 }
 
 pub(crate) struct ConsumeWorker<Tx> {
@@ -87,8 +80,7 @@ impl<Tx: TransactionWithMeta> ConsumeWorker<Tx> {
         self.metrics.clone()
     }
 
-    #[allow(clippy::result_large_err)]
-    pub fn run(self) -> Result<(), ConsumeWorkerError<Tx>> {
+    pub fn run(self) -> Result<(), ConsumeWorkerError> {
         let mut did_work = false;
         let mut last_empty_time = Instant::now();
         let mut sleep_duration = STARTING_SLEEP_DURATION;
@@ -97,11 +89,8 @@ impl<Tx: TransactionWithMeta> ConsumeWorker<Tx> {
             match self.consume_receiver.try_recv() {
                 Ok(work) => {
                     did_work = true;
-                    match self.consume(work)? {
-                        ProcessingStatus::Processed => {}
-                        ProcessingStatus::CouldNotProcess(work) => {
-                            self.retry_drain(work)?;
-                        }
+                    if let Some(work) = self.consume(work)? {
+                        self.retry_drain(work)?;
                     }
                 }
                 Err(TryRecvError::Empty) => {
@@ -123,26 +112,25 @@ impl<Tx: TransactionWithMeta> ConsumeWorker<Tx> {
         Ok(())
     }
 
-    /// Consume a single batch.
-    #[allow(clippy::result_large_err)]
+    /// Consume a batch, returning unprocessed work when no matching bank is active.
     fn consume(
         &self,
         mut work: ConsumeWork<Tx>,
-    ) -> Result<ProcessingStatus<Tx>, ConsumeWorkerError<Tx>> {
+    ) -> Result<Option<ConsumeWork<Tx>>, ConsumeWorkerError> {
         let Some(leader_state) = active_leader_state(&self.shared_leader_state) else {
-            return Ok(ProcessingStatus::CouldNotProcess(work));
+            return Ok(Some(work));
         };
         let bank = leader_state
             .working_bank()
             .expect("active_leader_state should only return an active bank");
         if bank.slot() != work.target_slot {
-            return Ok(ProcessingStatus::CouldNotProcess(work));
+            return Ok(Some(work));
         }
 
         if let Some(max_schedule_slot) = work.max_schedule_slot
             && max_schedule_slot < bank.slot()
         {
-            return self.retry(work);
+            return self.retry(work).map(|()| None);
         }
 
         // Best-effort tip-program upkeep for batches that touch tip accounts.
@@ -198,7 +186,7 @@ impl<Tx: TransactionWithMeta> ConsumeWorker<Tx> {
                 .retryable_transaction_indexes,
             extra_info,
         })?;
-        Ok(ProcessingStatus::Processed)
+        Ok(None)
     }
 
     /// Best-effort per-slot tip-program maintenance for batches that touch tip accounts.
@@ -338,8 +326,7 @@ impl<Tx: TransactionWithMeta> ConsumeWorker<Tx> {
     }
 
     /// Retry current batch and all outstanding batches.
-    #[allow(clippy::result_large_err)]
-    fn retry_drain(&self, work: ConsumeWork<Tx>) -> Result<(), ConsumeWorkerError<Tx>> {
+    fn retry_drain(&self, work: ConsumeWork<Tx>) -> Result<(), ConsumeWorkerError> {
         for work in try_drain_iter(work, &self.consume_receiver) {
             if self.exit.load(Ordering::Relaxed) {
                 return Ok(());
@@ -350,8 +337,7 @@ impl<Tx: TransactionWithMeta> ConsumeWorker<Tx> {
     }
 
     /// Send transactions back to scheduler as retryable.
-    #[allow(clippy::result_large_err)]
-    fn retry(&self, work: ConsumeWork<Tx>) -> Result<ProcessingStatus<Tx>, ConsumeWorkerError<Tx>> {
+    fn retry(&self, work: ConsumeWork<Tx>) -> Result<(), ConsumeWorkerError> {
         let retryable_indexes: Vec<_> = (0..work.transactions.len())
             .map(|index| RetryableIndex {
                 index,
@@ -379,7 +365,7 @@ impl<Tx: TransactionWithMeta> ConsumeWorker<Tx> {
             retryable_indexes,
             extra_info,
         })?;
-        Ok(ProcessingStatus::Processed)
+        Ok(())
     }
 }
 
@@ -2413,8 +2399,6 @@ impl ConsumeWorkerTransactionErrorMetrics {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::result_large_err)]
-
     use {
         super::*,
         crate::{
@@ -2823,7 +2807,7 @@ mod tests {
             max_schedule_slot: Some(bank.slot()),
             admission,
         };
-        if let ProcessingStatus::CouldNotProcess(work) = worker.consume(work).unwrap() {
+        if let Some(work) = worker.consume(work).unwrap() {
             worker.retry(work).unwrap();
         }
 
