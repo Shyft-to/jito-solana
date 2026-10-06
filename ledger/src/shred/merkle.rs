@@ -20,7 +20,10 @@ use {
     assert_matches::debug_assert_matches,
     itertools::{Either, Itertools},
     rayon::{ThreadPool, prelude::*},
-    reed_solomon_erasure::Error::{InvalidIndex, TooFewParityShards, TooFewShardsPresent},
+    reed_solomon_erasure::{
+        Error::{InvalidIndex, TooFewParityShards, TooFewShardsPresent},
+        galois_8 as gf,
+    },
     solana_clock::Slot,
     solana_hash::Hash,
     solana_keypair::Keypair,
@@ -1094,23 +1097,50 @@ pub fn recover_data<'a>(
         return Ok(Vec::new());
     }
 
-    // Reed-Solomon: rebuild only the missing data shards.
-    let mut shards = received
-        .iter()
-        .map(|shred| {
-            Ok(shred
-                .map(|s| s.erasure_shard())
-                .transpose()?
-                .map(<[u8]>::to_vec))
-        })
-        .collect::<Result<Vec<Option<Vec<u8>>>, Error>>()?;
-    reed_solomon_cache
-        .get(num_data_shreds, num_coding_shreds)?
-        .reconstruct_data(&mut shards)?;
+    // Reed-Solomon, data shards only. With D the missing data shards, K the received ones and J
+    // the first |D| received coding shards, coding_J = A d_D + P[J][K] d_K where A = P[J][D],
+    // so d_D = A^-1 coding_J + A^-1 P[J][K] d_K. Only the |D|x|D| matrix A is inverted (the
+    // crate's `reconstruct_data` inverts a full data x data matrix whenever its small LRU keyed
+    // by the whole loss pattern misses) and every missing shard is written straight from the
+    // received erasure shards into its stub shred, without copying input shards.
+    let parity = reed_solomon_cache.parity_matrix(num_data_shreds, num_coding_shreds)?;
+    let coding_rows: Vec<usize> = (num_data_shreds..num_shards)
+        .filter(|&i| received[i].is_some())
+        .take(missing.len())
+        .collect(); // received >= num_data_shreds, so there are at least |D| coding shreds
+    let parity_at =
+        |row: usize, col: usize| parity[(row - num_data_shreds) * num_data_shreds + col];
+    let n = missing.len();
+    // Never singular: any |D| parity rows x |D| columns of an MDS code are invertible.
+    let a_inv = gf_invert(
+        coding_rows
+            .iter()
+            .flat_map(|&row| missing.iter().map(move |&col| parity_at(row, col)))
+            .collect(),
+        n,
+    )
+    .ok_or(Error::InvalidRecoveredShred)?;
+    // Every input of the decode: received data shards, then the chosen coding shards.
+    let inputs: Vec<(usize, &[u8])> = (0..num_data_shreds)
+        .filter(|&i| received[i].is_some())
+        .chain(coding_rows.iter().copied())
+        .map(|i| Ok((i, received[i].unwrap().erasure_shard()?)))
+        .collect::<Result<_, Error>>()?;
 
-    let mut recovered = Vec::with_capacity(missing.len());
-    let mut leaves = Vec::with_capacity(missing.len());
-    for &index in &missing {
+    let mut recovered = Vec::with_capacity(n);
+    let mut leaves = Vec::with_capacity(n);
+    let mut coeffs = vec![0u8; inputs.len()];
+    for (r, &index) in missing.iter().enumerate() {
+        let a_inv_row = &a_inv[r * n..(r + 1) * n];
+        for (coeff, &(i, _)) in coeffs.iter_mut().zip(&inputs) {
+            *coeff = match coding_rows.iter().position(|&row| row == i) {
+                Some(j) => a_inv_row[j],
+                None => coding_rows
+                    .iter()
+                    .zip(a_inv_row)
+                    .fold(0, |acc, (&row, &c)| acc ^ gf::mul(c, parity_at(row, i))),
+            };
+        }
         let mut shred = make_stub_shred(
             index,
             &common_header,
@@ -1118,13 +1148,18 @@ pub fn recover_data<'a>(
             &chained_merkle_root,
             &retransmitter_signature,
         )?;
-        let shard = shards[index].take().ok_or(Error::InvalidRecoveredShred)?;
         {
             let mut slice = shred.erasure_shard_mut()?;
-            if slice.len() != shard.len() {
+            if inputs.iter().any(|(_, input)| input.len() != slice.len()) {
                 return Err(Error::InvalidRecoveredShred);
             }
-            slice.copy_from_slice(&shard);
+            // Overwrite with the first term (the stub's chained merkle root lies inside the
+            // erasure shard), then accumulate the rest.
+            let ((_, first), rest) = inputs.split_first().unwrap(); // |D| >= 1 coding inputs
+            gf::mul_slice(coeffs[0], first, &mut slice);
+            for (&coeff, (_, input)) in coeffs[1..].iter().zip(rest) {
+                gf::mul_slice_xor(coeff, input, &mut slice);
+            }
         }
         let Shred::ShredData(data_shred) = &mut shred else {
             return Err(Error::InvalidRecoveredShred);
@@ -1139,23 +1174,64 @@ pub fn recover_data<'a>(
         recovered.push(shred);
     }
 
-    // Verify against the signed root: first with the path of the received shred nearest to the
-    // missing ones, then (if that does not cover every recovered leaf) with all received shreds.
+    // Verify against the signed root. For each missing leaf take its lowest ancestor subtree
+    // holding a received shred and add that subtree's first received shred: the leaves of the
+    // child subtree on the missing leaf's side are then all recovered, and the node they
+    // derive is on the added shred's proof. Missing leaves under the same child subtree share
+    // the added shred. If that does not cover every recovered leaf, add all received shreds.
     let mut nodes = AuthenticatedNodes::new(num_shards);
-    let nearest = (0..num_shards)
-        .filter(|&i| received[i].is_some())
-        .min_by_key(|&i| i.abs_diff(missing[0]))
-        .unwrap(); // at least num_data_shreds >= 1 shreds were received
-    nodes.add(nearest, received[nearest].unwrap())?;
+    let mut added = vec![false; num_shards];
+    for &index in &missing {
+        let nearest = (1..usize::BITS)
+            .find_map(|level| {
+                let start = (index >> level) << level;
+                let end = (start + (1 << level)).min(num_shards);
+                (start..end).find(|&i| received[i].is_some())
+            })
+            .unwrap(); // at least num_data_shreds >= 1 shreds were received
+        if !std::mem::replace(&mut added[nearest], true) {
+            nodes.add(nearest, received[nearest].unwrap())?;
+        }
+    }
     if nodes.verify(&leaves).is_err() {
         for (index, shred) in received.iter().enumerate() {
-            if let Some(shred) = shred {
+            if let Some(shred) = shred.filter(|_| !added[index]) {
                 nodes.add(index, shred)?;
             }
         }
         nodes.verify(&leaves)?;
     }
     Ok(recovered)
+}
+
+/// Inverts the row-major `n x n` matrix `m` over GF(2^8); `None` if it is singular.
+fn gf_invert(mut m: Vec<u8>, n: usize) -> Option<Vec<u8>> {
+    let mut inv = vec![0u8; n * n];
+    for i in 0..n {
+        inv[i * n + i] = 1;
+    }
+    for col in 0..n {
+        let pivot = (col..n).find(|&r| m[r * n + col] != 0)?;
+        for k in 0..n {
+            m.swap(col * n + k, pivot * n + k);
+            inv.swap(col * n + k, pivot * n + k);
+        }
+        let p = m[col * n + col];
+        for k in 0..n {
+            m[col * n + k] = gf::div(m[col * n + k], p);
+            inv[col * n + k] = gf::div(inv[col * n + k], p);
+        }
+        for r in (0..n).filter(|&r| r != col) {
+            let f = m[r * n + col];
+            if f != 0 {
+                for k in 0..n {
+                    m[r * n + k] ^= gf::mul(f, m[col * n + k]);
+                    inv[r * n + k] ^= gf::mul(f, inv[col * n + k]);
+                }
+            }
+        }
+    }
+    Some(inv)
 }
 
 // Compares shreds of the same erasure batch by their erasure shard index
@@ -1948,6 +2024,15 @@ mod test {
                 assert_matches!(result.err(), Some(Error::Erasure(TooFewShardsPresent)));
                 continue;
             }
+            // When the data shards do not fill whole merkle subtrees, a recovered leaf can share
+            // its lowest known ancestor with missing coding shreds and cannot be verified
+            // without regenerating them: recover_data declines and callers fall back to
+            // `recover`. Never the case for full 32:32 batches (the data half is one subtree).
+            if matches!(result, Err(Error::InvalidMerkleRoot))
+                && (num_data_shreds, num_shreds) != (32, 64)
+            {
+                continue;
+            }
             let recovered = result.unwrap();
             let mut removed: Vec<_> = removed
                 .into_iter()
@@ -2002,11 +2087,28 @@ mod test {
             payload[offset] ^= 0x01;
             kept[target] = Shred::from_payload(payload).unwrap();
             let (data, coding) = split_for_recover_data(&kept, 32);
-            assert_matches!(
-                recover_data(&data, coding.iter(), &cache),
-                Err(Error::InvalidMerkleRoot),
-                "corrupt shred {target} was accepted"
-            );
+            // Never wrong data: rejected by the merkle check or, when the flipped byte lands in
+            // the recovered headers, by the header check. A corrupt shred the decode did not
+            // need (a coding shred beyond the first |missing|) leaves the output intact.
+            match recover_data(&data, coding.iter(), &cache) {
+                Err(Error::InvalidMerkleRoot | Error::InvalidRecoveredShred) => (),
+                Ok(recovered) => {
+                    assert_eq!(recovered.len(), missing.len());
+                    for (got, &index) in recovered.iter().zip(&missing) {
+                        let (Shred::ShredData(got), Shred::ShredData(want)) = (got, &batch[index])
+                        else {
+                            panic!("expected data shreds");
+                        };
+                        let end = want.proof_offset().unwrap();
+                        assert_eq!(
+                            got.payload[..end],
+                            want.payload[..end],
+                            "corrupt shred {target} produced wrong data"
+                        );
+                    }
+                }
+                Err(err) => panic!("corrupt shred {target}: unexpected {err:?}"),
+            }
         }
 
         // A coding shred from another batch is rejected.
@@ -2340,6 +2442,44 @@ mod test {
             .values()
         {
             verify_erasure_recovery(rng, shreds, reed_solomon_cache);
+        }
+    }
+
+    // Latency of `recover_data` by number of missing data shreds, with random coding-shred loss.
+    // cargo test --release -p solana-ledger --lib bench_recover_data -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn bench_recover_data() {
+        let mut rng = rand::rng();
+        let cache = ReedSolomonCache::default();
+        let batch = make_merkle_batch(&mut rng, true, 32, 32, &cache);
+        for num_missing in [1, 2, 4, 8, 16, 32] {
+            let mut times = Vec::with_capacity(2000);
+            for _ in 0..2000 {
+                let mut data_idx: Vec<usize> = (0..32).collect();
+                data_idx.shuffle(&mut rng);
+                let mut code_idx: Vec<usize> = (32..64).collect();
+                code_idx.shuffle(&mut rng);
+                let num_code_lost = rng.random_range(0..=32 - num_missing);
+                let kept: Vec<Shred> = data_idx[num_missing..]
+                    .iter()
+                    .chain(&code_idx[num_code_lost..])
+                    .map(|&i| batch[i].clone())
+                    .collect();
+                let (data, coding) = split_for_recover_data(&kept, 32);
+                let start = std::time::Instant::now();
+                let recovered = recover_data(&data, coding.iter(), &cache).unwrap();
+                times.push(start.elapsed().as_nanos() as u64);
+                assert_eq!(recovered.len(), num_missing);
+            }
+            times.sort_unstable();
+            let pct = |p: usize| times[times.len() * p / 100] as f64 / 1000.0;
+            println!(
+                "missing={num_missing:2} p50={:7.1}us p90={:7.1}us p99={:7.1}us",
+                pct(50),
+                pct(90),
+                pct(99)
+            );
         }
     }
 }

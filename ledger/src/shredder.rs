@@ -34,7 +34,11 @@ pub struct ReedSolomonCache(
         (usize, usize), // number of {data,parity} shards
         Result<Arc<ReedSolomon>, reed_solomon_erasure::Error>,
     >,
+    // Parity rows of the encoding matrix, row-major `parity x data`.
+    LruCacheOnce<(usize, usize), ParityMatrix>,
 );
+
+type ParityMatrix = Result<Arc<[u8]>, reed_solomon_erasure::Error>;
 
 #[derive(Debug)]
 pub struct Shredder {
@@ -280,28 +284,52 @@ impl ReedSolomonCache {
         data_shards: usize,
         parity_shards: usize,
     ) -> Result<Arc<ReedSolomon>, reed_solomon_erasure::Error> {
-        let key = (data_shards, parity_shards);
-        // Read from the cache with a shared lock.
-        let entry = self.0.read().unwrap().get(&key).cloned();
-        // Fall back to exclusive lock if there is a cache miss.
-        let entry: Arc<OnceLock<Result<_, _>>> = entry.unwrap_or_else(|| {
-            let mut cache = self.0.write().unwrap();
-            cache.get(&key).cloned().unwrap_or_else(|| {
-                let entry = Arc::<OnceLock<Result<_, _>>>::default();
-                cache.put(key, Arc::clone(&entry));
-                entry
-            })
-        });
-        // Initialize if needed by only a single thread outside locks.
-        entry
-            .get_or_init(|| ReedSolomon::new(data_shards, parity_shards).map(Arc::new))
-            .clone()
+        get_or_init(&self.0, (data_shards, parity_shards), || {
+            ReedSolomon::new(data_shards, parity_shards).map(Arc::new)
+        })
     }
+
+    /// Parity rows of the systematic encoding matrix, row-major `parity_shards x data_shards`:
+    /// parity shard `j` is `sum_i matrix[j * data_shards + i] * data shard i` over GF(2^8).
+    pub(crate) fn parity_matrix(&self, data_shards: usize, parity_shards: usize) -> ParityMatrix {
+        get_or_init(&self.1, (data_shards, parity_shards), || {
+            // Encoding unit vectors (byte i of data shard i set) yields the matrix column-wise.
+            let mut shards = vec![vec![0u8; data_shards]; data_shards + parity_shards];
+            for (i, shard) in shards.iter_mut().take(data_shards).enumerate() {
+                shard[i] = 1;
+            }
+            self.get(data_shards, parity_shards)?.encode(&mut shards)?;
+            Ok(shards.into_iter().skip(data_shards).flatten().collect())
+        })
+    }
+}
+
+fn get_or_init<V: Clone>(
+    cache: &LruCacheOnce<(usize, usize), V>,
+    key: (usize, usize),
+    init: impl FnOnce() -> V,
+) -> V {
+    // Read from the cache with a shared lock.
+    let entry = cache.read().unwrap().get(&key).cloned();
+    // Fall back to exclusive lock if there is a cache miss.
+    let entry: Arc<OnceLock<V>> = entry.unwrap_or_else(|| {
+        let mut cache = cache.write().unwrap();
+        cache.get(&key).cloned().unwrap_or_else(|| {
+            let entry = Arc::<OnceLock<V>>::default();
+            cache.put(key, Arc::clone(&entry));
+            entry
+        })
+    });
+    // Initialize if needed by only a single thread outside locks.
+    entry.get_or_init(init).clone()
 }
 
 impl Default for ReedSolomonCache {
     fn default() -> Self {
-        Self(RwLock::new(LruCache::new(Self::CAPACITY)))
+        Self(
+            RwLock::new(LruCache::new(Self::CAPACITY)),
+            RwLock::new(LruCache::new(Self::CAPACITY)),
+        )
     }
 }
 
