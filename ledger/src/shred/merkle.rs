@@ -20,7 +20,7 @@ use {
     assert_matches::debug_assert_matches,
     itertools::{Either, Itertools},
     rayon::{ThreadPool, prelude::*},
-    reed_solomon_erasure::Error::{InvalidIndex, TooFewParityShards},
+    reed_solomon_erasure::Error::{InvalidIndex, TooFewParityShards, TooFewShardsPresent},
     solana_clock::Slot,
     solana_hash::Hash,
     solana_keypair::Keypair,
@@ -32,6 +32,7 @@ use {
     std::{
         cmp::Ordering,
         io::{Cursor, Write},
+        iter::successors,
         ops::Range,
         time::Instant,
     },
@@ -74,6 +75,7 @@ pub enum Shred {
 }
 
 impl Shred {
+    dispatch!(fn erasure_shard(&self) -> Result<&[u8], Error>);
     dispatch!(fn erasure_shard_index(&self) -> Result<usize, Error>);
     dispatch!(fn erasure_shard_mut(&mut self) -> Result<PayloadMutGuard<'_, Range<usize>>, Error>);
     dispatch!(fn merkle_node(&self) -> Result<Hash, Error>);
@@ -145,7 +147,6 @@ impl Shred {
 
 #[cfg(test)]
 impl Shred {
-    dispatch!(fn erasure_shard(&self) -> Result<&[u8], Error>);
     dispatch!(fn proof_size(&self) -> Result<u8, Error>);
     dispatch!(pub(super) fn chained_merkle_root(&self) -> Result<Hash, Error>);
     dispatch!(pub(super) fn merkle_root(&self) -> Result<Hash, Error>);
@@ -866,6 +867,297 @@ pub fn recover(
         .filter_map(Result::transpose))
 }
 
+/// Merkle nodes that are known to be committed to by the signed merkle root of one erasure
+/// batch, collected from the paths and proofs of received shreds. Used by [`recover_data`] to
+/// verify recovered shreds without rebuilding the whole tree.
+struct AuthenticatedNodes {
+    /// Number of nodes on each level of the tree, leaves first.
+    sizes: Vec<usize>,
+    /// `nodes[level][index]`; entries are `Hash`es zero-padded past `MerkleProofEntry` size,
+    /// only their first `SIZE_OF_MERKLE_PROOF_ENTRY` bytes are meaningful (except the root).
+    nodes: Vec<Vec<Option<Hash>>>,
+    root: Option<Hash>,
+}
+
+impl AuthenticatedNodes {
+    fn new(num_shards: usize) -> Self {
+        let sizes: Vec<usize> =
+            successors(Some(num_shards), |&k| (k > 1).then_some((k + 1) >> 1)).collect();
+        let nodes = sizes.iter().map(|&n| vec![None; n]).collect();
+        Self {
+            sizes,
+            nodes,
+            root: None,
+        }
+    }
+
+    fn top(&self) -> usize {
+        self.sizes.len() - 1
+    }
+
+    fn same(a: &Hash, b: &Hash) -> bool {
+        a.as_ref()[..SIZE_OF_MERKLE_PROOF_ENTRY] == b.as_ref()[..SIZE_OF_MERKLE_PROOF_ENTRY]
+    }
+
+    fn set(&mut self, level: usize, index: usize, node: Hash) -> Result<(), Error> {
+        match &self.nodes[level][index] {
+            Some(known) if !Self::same(known, &node) => Err(Error::InvalidMerkleRoot),
+            Some(_) => Ok(()),
+            None => {
+                self.nodes[level][index] = Some(node);
+                Ok(())
+            }
+        }
+    }
+
+    /// Hashes the received shred at erasure shard `index`, walks its merkle proof up to the
+    /// root, and records every node on that path and every sibling in its proof. All added
+    /// shreds must lead to the same root.
+    fn add(&mut self, index: usize, shred: &Shred) -> Result<(), Error> {
+        let top = self.top();
+        let mut node = shred.merkle_node()?;
+        let mut proof = shred.merkle_proof()?;
+        let mut i = index;
+        for level in 0..top {
+            let entry = proof.next().ok_or(Error::InvalidMerkleProof)?;
+            self.set(level, i, node)?;
+            let mut sibling = [0u8; SIZE_OF_MERKLE_ROOT];
+            sibling[..SIZE_OF_MERKLE_PROOF_ENTRY].copy_from_slice(entry);
+            let sibling_index = (i ^ 1).min(self.sizes[level] - 1);
+            self.set(level, sibling_index, Hash::new_from_array(sibling))?;
+            node = if i % 2 == 0 {
+                join_nodes(node, entry)
+            } else {
+                join_nodes(entry, node)
+            };
+            i >>= 1;
+        }
+        if proof.next().is_some() {
+            return Err(Error::InvalidMerkleProof);
+        }
+        match self.root {
+            Some(root) if root != node => return Err(Error::InvalidMerkleRoot),
+            _ => self.root = Some(node),
+        }
+        self.nodes[top][0] = Some(node);
+        Ok(())
+    }
+
+    /// Checks that every recovered leaf `(erasure shard index, leaf hash)` hashes up, through
+    /// nodes derived from recovered leaves and known nodes, to a node already committed to by
+    /// the root. Fails closed: a leaf that cannot be tied to the root is an error.
+    fn verify(&self, leaves: &[(usize, Hash)]) -> Result<(), Error> {
+        let top = self.top();
+        let mut derived: Vec<Vec<Option<Hash>>> =
+            self.sizes.iter().map(|&n| vec![None; n]).collect();
+        for &(index, leaf) in leaves {
+            derived[0][index] = Some(leaf);
+        }
+        for level in 0..top {
+            for parent in 0..self.sizes[level + 1] {
+                let left = 2 * parent;
+                let right = (left + 1).min(self.sizes[level] - 1);
+                if derived[level][left].is_none() && derived[level][right].is_none() {
+                    continue;
+                }
+                let get = |i: usize| derived[level][i].or(self.nodes[level][i]);
+                if let (Some(l), Some(r)) = (get(left), get(right)) {
+                    derived[level + 1][parent] = Some(join_nodes(l, r));
+                }
+            }
+        }
+        for &(index, _) in leaves {
+            let mut i = index;
+            let mut verified = false;
+            for level in 0..=top {
+                let Some(node) = derived[level][i] else { break };
+                if let Some(known) = self.nodes[level][i] {
+                    let ok = if level == top {
+                        node == known
+                    } else {
+                        Self::same(&node, &known)
+                    };
+                    if !ok {
+                        return Err(Error::InvalidMerkleRoot);
+                    }
+                    verified = true;
+                    break;
+                }
+                i >>= 1;
+            }
+            if !verified {
+                return Err(Error::InvalidMerkleRoot);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Recovers only the missing *data* shreds of one erasure batch, and verifies them against the
+/// batch's merkle root.
+///
+/// `data` holds every data slot of the batch (`None` for missing ones), `coding` the received
+/// coding shreds. Same guarantees as [`recover`] for the returned shreds: they belong to the
+/// same signed merkle root as the received shreds (a corrupt or foreign input shred makes the
+/// recovered bytes fail the check, so the call errors instead of returning wrong data).
+///
+/// Cheaper than [`recover`] because it does not regenerate missing coding shreds, does not
+/// rebuild the whole merkle tree, and does not set merkle proofs on the output. Instead the
+/// merkle path of one received shred near the missing ones is walked to the root and the
+/// recovered leaves must hash up to nodes on it; if that is not enough the paths of all
+/// received shreds are used. Recovered data shreds therefore carry a zeroed merkle proof and
+/// retransmitter signature.
+pub fn recover_data<'a>(
+    data: &[Option<Shred>],
+    coding: impl IntoIterator<Item = &'a Shred>,
+    reed_solomon_cache: &ReedSolomonCache,
+) -> Result<Vec<Shred>, Error> {
+    let coding: Vec<&Shred> = coding.into_iter().collect();
+    let Some(Shred::ShredCode(first)) = coding.first() else {
+        return Err(Error::from(TooFewParityShards));
+    };
+    let position = u32::from(first.coding_header.position);
+    let common_header = ShredCommonHeader {
+        index: (first.common_header.index.checked_sub(position))
+            .ok_or(Error::from(InvalidIndex))?,
+        ..first.common_header
+    };
+    let coding_header = CodingShredHeader {
+        position: 0u16,
+        ..first.coding_header
+    };
+    let ShredVariant::MerkleCode {
+        proof_size,
+        resigned,
+    } = common_header.shred_variant
+    else {
+        return Err(Error::InvalidShredVariant);
+    };
+    let chained_merkle_root = first.chained_merkle_root().ok();
+    let retransmitter_signature = first.retransmitter_signature().ok();
+    let num_data_shreds = usize::from(coding_header.num_data_shreds);
+    let num_coding_shreds = usize::from(coding_header.num_coding_shreds);
+    let num_shards = num_data_shreds + num_coding_shreds;
+    if data.len() != num_data_shreds {
+        return Err(Error::from(InvalidIndex));
+    }
+    if proof_size != get_proof_size(num_shards) {
+        return Err(Error::InvalidProofSize(proof_size));
+    }
+
+    // Place received shreds by erasure shard index, checking they belong to this batch.
+    let mut received: Vec<Option<&Shred>> = vec![None; num_shards];
+    for (slot, shred) in data
+        .iter()
+        .enumerate()
+        .filter_map(|(i, s)| s.as_ref().map(|s| (Some(i), s)))
+        .chain(coding.iter().map(|&s| (None, s)))
+    {
+        let header = shred.common_header();
+        let same_batch = header.signature == common_header.signature
+            && header.slot == common_header.slot
+            && header.version == common_header.version
+            && header.fec_set_index == common_header.fec_set_index;
+        let consistent = match shred {
+            Shred::ShredData(_) => {
+                header.shred_variant
+                    == ShredVariant::MerkleData {
+                        proof_size,
+                        resigned,
+                    }
+            }
+            Shred::ShredCode(code) => {
+                header.shred_variant == common_header.shred_variant
+                    && code.coding_header.num_data_shreds == coding_header.num_data_shreds
+                    && code.coding_header.num_coding_shreds == coding_header.num_coding_shreds
+            }
+        };
+        if !same_batch || !consistent {
+            return Err(Error::InvalidMerkleRoot);
+        }
+        let index = shred.erasure_shard_index()?;
+        let in_range = match slot {
+            Some(slot) => index == slot,
+            None => (num_data_shreds..num_shards).contains(&index),
+        };
+        if !in_range || received[index].replace(shred).is_some() {
+            return Err(Error::from(InvalidIndex));
+        }
+    }
+    if received.iter().flatten().count() < num_data_shreds {
+        return Err(Error::from(TooFewShardsPresent));
+    }
+    let missing: Vec<usize> = (0..num_data_shreds)
+        .filter(|&i| received[i].is_none())
+        .collect();
+    if missing.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Reed-Solomon: rebuild only the missing data shards.
+    let mut shards = received
+        .iter()
+        .map(|shred| {
+            Ok(shred
+                .map(|s| s.erasure_shard())
+                .transpose()?
+                .map(<[u8]>::to_vec))
+        })
+        .collect::<Result<Vec<Option<Vec<u8>>>, Error>>()?;
+    reed_solomon_cache
+        .get(num_data_shreds, num_coding_shreds)?
+        .reconstruct_data(&mut shards)?;
+
+    let mut recovered = Vec::with_capacity(missing.len());
+    let mut leaves = Vec::with_capacity(missing.len());
+    for &index in &missing {
+        let mut shred = make_stub_shred(
+            index,
+            &common_header,
+            &coding_header,
+            &chained_merkle_root,
+            &retransmitter_signature,
+        )?;
+        let shard = shards[index].take().ok_or(Error::InvalidRecoveredShred)?;
+        {
+            let mut slice = shred.erasure_shard_mut()?;
+            if slice.len() != shard.len() {
+                return Err(Error::InvalidRecoveredShred);
+            }
+            slice.copy_from_slice(&shard);
+        }
+        let Shred::ShredData(data_shred) = &mut shred else {
+            return Err(Error::InvalidRecoveredShred);
+        };
+        let (header, data_header) = wincode::deserialize(&data_shred.payload[..])?;
+        if data_shred.common_header != header {
+            return Err(Error::InvalidRecoveredShred);
+        }
+        data_shred.data_header = data_header;
+        shred.sanitize()?;
+        leaves.push((index, shred.merkle_node()?));
+        recovered.push(shred);
+    }
+
+    // Verify against the signed root: first with the path of the received shred nearest to the
+    // missing ones, then (if that does not cover every recovered leaf) with all received shreds.
+    let mut nodes = AuthenticatedNodes::new(num_shards);
+    let nearest = (0..num_shards)
+        .filter(|&i| received[i].is_some())
+        .min_by_key(|&i| i.abs_diff(missing[0]))
+        .unwrap(); // at least num_data_shreds >= 1 shreds were received
+    nodes.add(nearest, received[nearest].unwrap())?;
+    if nodes.verify(&leaves).is_err() {
+        for (index, shred) in received.iter().enumerate() {
+            if let Some(shred) = shred {
+                nodes.add(index, shred)?;
+            }
+        }
+        nodes.verify(&leaves)?;
+    }
+    Ok(recovered)
+}
+
 // Compares shreds of the same erasure batch by their erasure shard index
 // within the erasure batch.
 #[inline]
@@ -1495,6 +1787,25 @@ mod test {
         num_coding_shreds: usize,
         reed_solomon_cache: &ReedSolomonCache,
     ) {
+        let shreds = make_merkle_batch(
+            rng,
+            resigned,
+            num_data_shreds,
+            num_coding_shreds,
+            reed_solomon_cache,
+        );
+        verify_erasure_recovery(rng, &shreds, reed_solomon_cache);
+        verify_recover_data(rng, &shreds, reed_solomon_cache);
+    }
+
+    // Builds one signed erasure batch: data shreds followed by coding shreds.
+    fn make_merkle_batch<R: Rng + CryptoRng>(
+        rng: &mut R,
+        resigned: bool,
+        num_data_shreds: usize,
+        num_coding_shreds: usize,
+        reed_solomon_cache: &ReedSolomonCache,
+    ) -> Vec<Shred> {
         let keypair = Keypair::new();
         let num_shreds = num_data_shreds + num_coding_shreds;
         let proof_size = get_proof_size(num_shreds);
@@ -1591,7 +1902,117 @@ mod test {
             assert!(shred.verify(&keypair.pubkey()));
             assert_matches!(shred.sanitize(), Ok(()));
         }
-        verify_erasure_recovery(rng, &shreds, reed_solomon_cache);
+        shreds
+    }
+
+    // Splits a batch into `recover_data` inputs: data slots and coding shreds.
+    fn split_for_recover_data(
+        kept: &[Shred],
+        num_data_shreds: usize,
+    ) -> (Vec<Option<Shred>>, Vec<Shred>) {
+        let mut data = vec![None; num_data_shreds];
+        let mut coding = Vec::new();
+        for shred in kept {
+            match shred {
+                Shred::ShredData(d) => {
+                    let i = (d.common_header.index - d.common_header.fec_set_index) as usize;
+                    data[i] = Some(shred.clone());
+                }
+                Shred::ShredCode(_) => coding.push(shred.clone()),
+            }
+        }
+        (data, coding)
+    }
+
+    fn verify_recover_data<R: Rng>(
+        rng: &mut R,
+        shreds: &[Shred],
+        reed_solomon_cache: &ReedSolomonCache,
+    ) {
+        let num_shreds = shreds.len();
+        let num_data_shreds = shreds
+            .iter()
+            .filter(|shred| shred.shred_type() == ShredType::Data)
+            .count();
+        for size in 0..num_shreds {
+            let mut kept = Vec::from(shreds);
+            kept.shuffle(rng);
+            let removed = kept.split_off(size);
+            let (data, coding) = split_for_recover_data(&kept, num_data_shreds);
+            let result = recover_data(&data, coding.iter(), reed_solomon_cache);
+            if coding.is_empty() {
+                assert_matches!(result.err(), Some(Error::Erasure(TooFewParityShards)));
+                continue;
+            }
+            if kept.len() < num_data_shreds {
+                assert_matches!(result.err(), Some(Error::Erasure(TooFewShardsPresent)));
+                continue;
+            }
+            let recovered = result.unwrap();
+            let mut removed: Vec<_> = removed
+                .into_iter()
+                .filter(|shred| shred.shred_type() == ShredType::Data)
+                .collect();
+            removed.sort_by_key(Shred::index);
+            assert_eq!(recovered.len(), removed.len());
+            for (got, want) in recovered.iter().zip(&removed) {
+                let (Shred::ShredData(got), Shred::ShredData(want)) = (got, want) else {
+                    panic!("expected data shreds");
+                };
+                // Everything except the (unset) merkle proof and retransmitter signature.
+                let end = want.proof_offset().unwrap();
+                assert_eq!(got.common_header, want.common_header);
+                assert_eq!(got.data_header, want.data_header);
+                assert_eq!(got.payload[..end], want.payload[..end]);
+            }
+        }
+    }
+
+    // Recovery must fail, not return wrong data, when an input shred is corrupt or foreign.
+    #[test_case(1)]
+    #[test_case(5)]
+    #[test_case(32)]
+    fn test_recover_data_rejects_corrupt_input(num_missing: usize) {
+        let mut rng = rand::rng();
+        let cache = ReedSolomonCache::default();
+        let batch = make_merkle_batch(&mut rng, false, 32, 32, &cache);
+        let foreign = make_merkle_batch(&mut rng, false, 32, 32, &cache);
+        // Drop `num_missing` data shreds; everything else is received.
+        let missing: Vec<usize> = (0..32)
+            .step_by(32 / num_missing.min(32))
+            .take(num_missing)
+            .collect();
+        let kept: Vec<Shred> = batch
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !missing.contains(i))
+            .map(|(_, s)| s.clone())
+            .collect();
+        let (data, coding) = split_for_recover_data(&kept, 32);
+        assert!(recover_data(&data, coding.iter(), &cache).is_ok());
+
+        // Flip one byte of the payload (erasure shard region) of each received shred in turn.
+        for target in 0..kept.len() {
+            let mut kept = kept.clone();
+            let offset = match &kept[target] {
+                Shred::ShredData(_) => ShredData::SIZE_OF_HEADERS + 7,
+                Shred::ShredCode(_) => ShredCode::SIZE_OF_HEADERS + 7,
+            };
+            let mut payload = kept[target].payload().to_vec();
+            payload[offset] ^= 0x01;
+            kept[target] = Shred::from_payload(payload).unwrap();
+            let (data, coding) = split_for_recover_data(&kept, 32);
+            assert_matches!(
+                recover_data(&data, coding.iter(), &cache),
+                Err(Error::InvalidMerkleRoot),
+                "corrupt shred {target} was accepted"
+            );
+        }
+
+        // A coding shred from another batch is rejected.
+        let (data, mut coding) = split_for_recover_data(&kept, 32);
+        coding[0] = foreign[40].clone();
+        assert!(recover_data(&data, coding.iter(), &cache).is_err());
     }
 
     fn verify_erasure_recovery<R: Rng>(

@@ -104,7 +104,7 @@ impl MerkleTree {
 }
 
 // Obtains parent's hash by joining two sibling nodes in merkle tree.
-fn join_nodes<S: AsRef<[u8]>, T: AsRef<[u8]>>(node: S, other: T) -> Hash {
+pub(crate) fn join_nodes<S: AsRef<[u8]>, T: AsRef<[u8]>>(node: S, other: T) -> Hash {
     let node = &node.as_ref()[..SIZE_OF_MERKLE_PROOF_ENTRY];
     let other = &other.as_ref()[..SIZE_OF_MERKLE_PROOF_ENTRY];
     hashv(&[MERKLE_HASH_PREFIX_NODE, node, other])
